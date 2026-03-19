@@ -2,19 +2,18 @@ name: Actualizar propiedades
 
 on:
   schedule:
-    # Corre cada 4 horas (gratis en GitHub)
     - cron: '0 */4 * * *'
-  workflow_dispatch:  # Permite correrlo manualmente desde GitHub
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    
     steps:
       - name: Descargar código
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Instalar Python
         uses: actions/setup-python@v5
@@ -27,10 +26,10 @@ jobs:
       - name: Correr scraper
         run: python scraper.py
 
-      - name: Subir resultados al sitio
+      - name: Subir resultados
         run: |
           git config user.name "PropiedadesChile Bot"
           git config user.email "bot@propiedadeschile.cl"
           git add propiedades.json
-          git diff --staged --quiet || git commit -m "Actualización automática $(date '+%d/%m/%Y %H:%M')"
+          git diff --staged --quiet || git commit -m "Actualización $(date '+%d/%m/%Y %H:%M')"
           git push
