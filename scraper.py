@@ -1,7 +1,7 @@
 """
-scraper.py — PropiedadesChile
-Raspa Portal Inmobiliario, Yapo, TocToc y Mercado Libre.
-Genera propiedades.json para el sitio web.
+scraper.py — PropiedadesChile v2
+Usa APIs internas y selectores más robustos.
+Mercado Libre tiene API pública — es el más confiable.
 """
 import json, time, random, logging, re
 from datetime import datetime
@@ -12,24 +12,41 @@ from bs4 import BeautifulSoup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("scraper")
 
-PAGINAS_POR_PORTAL = 3   # Aumentar para más resultados (más lento)
-DELAY = (2, 5)           # Segundos entre requests
+PAGINAS = 3
+DELAY = (3, 7)
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept-Language": "es-CL,es;q=0.9",
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
 }
 
-def get(url):
+session = requests.Session()
+session.headers.update(HEADERS)
+
+def get_html(url):
     time.sleep(random.uniform(*DELAY))
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
+        r = session.get(url, timeout=25)
         r.raise_for_status()
         return r
     except Exception as e:
-        log.warning(f"  Error: {e}")
+        log.warning(f"  Error GET: {e}")
+        return None
+
+def get_json(url, extra_headers=None):
+    time.sleep(random.uniform(*DELAY))
+    try:
+        h = {**HEADERS, "Accept": "application/json"}
+        if extra_headers:
+            h.update(extra_headers)
+        r = requests.get(url, headers=h, timeout=25)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log.warning(f"  Error JSON: {e}")
         return None
 
 def num(texto):
@@ -37,170 +54,320 @@ def num(texto):
     s = re.sub(r"[^\d]", "", str(texto))
     return int(s) if s else 0
 
-# ─── PORTAL INMOBILIARIO ──────────────────────────────────────────
-def scrape_pi(tipo, propiedad):
+def limpiar_precio(texto):
+    if not texto: return 0
+    s = re.sub(r"[^\d]", "", str(texto))
+    return int(s) if s else 0
+
+# ─── MERCADO LIBRE (API pública oficial) ─────────────────────────
+def scrape_mercadolibre(tipo, propiedad):
     results = []
-    base = "https://www.portalinmobiliario.com"
-    log.info(f"[Portal Inmobiliario] {tipo} / {propiedad}")
-    for pag in range(1, PAGINAS_POR_PORTAL + 1):
-        url = f"{base}/{tipo}/{propiedad}/_Desde_{(pag-1)*20+1}_NoIndex_True"
-        r = get(url)
-        if not r: continue
-        soup = BeautifulSoup(r.text, "html.parser")
-        cards = soup.select(".ui-search-result__wrapper, .andes-card")
-        for card in cards:
+    log.info(f"[Mercado Libre] {tipo}/{propiedad}")
+
+    cat_map = {
+        "departamento": "MLC1459",
+        "casa": "MLC1452",
+        "oficina": "MLC1467",
+        "local": "MLC1470",
+        "terreno": "MLC1462",
+    }
+    op_map = {"arriendo": "rent", "venta": "sale"}
+
+    cat_id = cat_map.get(propiedad, "MLC1459")
+    op = op_map.get(tipo, "rent")
+
+    for pag in range(1, PAGINAS + 1):
+        offset = (pag - 1) * 48
+        url = f"https://api.mercadolibre.com/sites/MLC/search?category={cat_id}&OPERATION={op}&offset={offset}&limit=48"
+        data = get_json(url)
+
+        if not data or "results" not in data:
+            log.warning(f"  Sin resultados en pág {pag}")
+            continue
+
+        for item in data["results"]:
             try:
-                titulo = card.select_one(".ui-search-item__title, h2")
-                precio_el = card.select_one(".price-tag-fraction")
-                ubicacion = card.select_one(".ui-search-item__location, .ui-search-item__group--location")
-                link = card.select_one("a[href]")
-                img = card.select_one("img[data-src], img[src]")
-                dorm_el = [a for a in card.select(".ui-search-card-attributes__attribute") if "dorm" in a.get_text().lower()]
-                bano_el = [a for a in card.select(".ui-search-card-attributes__attribute") if "baño" in a.get_text().lower()]
-                sup_el  = [a for a in card.select(".ui-search-card-attributes__attribute") if "m²" in a.get_text()]
-                moneda = card.select_one(".price-tag-symbol")
-                es_uf = moneda and "UF" in moneda.get_text()
-                precio = num(precio_el.get_text() if precio_el else "0")
+                precio = int(item.get("price", 0) or 0)
+                moneda = item.get("currency_id", "CLP")
+                foto = item.get("thumbnail", "").replace("-I.jpg", "-O.jpg")
+
+                attrs = {"dormitorios": 0, "banos": 0, "superficie": 0}
+                for a in item.get("attributes", []):
+                    iid = a.get("id", "")
+                    val = a.get("value_name", "") or ""
+                    if "BEDROOM" in iid:
+                        attrs["dormitorios"] = num(val)
+                    elif "BATHROOM" in iid:
+                        attrs["banos"] = num(val)
+                    elif "TOTAL_AREA" in iid or "COVERED_AREA" in iid:
+                        attrs["superficie"] = num(val)
+
+                loc = item.get("location", {})
+                ciudad = ""
+                if isinstance(loc, dict):
+                    ciudad = (loc.get("city") or {}).get("name", "") or \
+                             (loc.get("state") or {}).get("name", "")
+
                 prop = {
-                    "titulo": titulo.get_text(strip=True) if titulo else "",
-                    "tipo": tipo, "propiedad": propiedad,
-                    "comuna": ubicacion.get_text(strip=True) if ubicacion else "",
+                    "titulo": item.get("title", ""),
+                    "tipo": tipo,
+                    "propiedad": propiedad,
+                    "comuna": ciudad,
                     "precio": precio,
-                    "uf": round(precio) if es_uf else None,
-                    "dormitorios": num(dorm_el[0].get_text()) if dorm_el else 0,
-                    "banos": num(bano_el[0].get_text()) if bano_el else 0,
-                    "superficie": num(sup_el[0].get_text()) if sup_el else 0,
-                    "portal": "Portal Inmobiliario",
-                    "url": link["href"] if link else "",
-                    "foto": (img.get("data-src") or img.get("src","")) if img else "",
+                    "uf": precio if moneda == "CLF" else None,
+                    "portal": "Mercado Libre",
+                    "url": item.get("permalink", ""),
+                    "foto": foto,
                     "fecha": datetime.now().isoformat(),
                     "fecha_scraping": datetime.now().isoformat(),
+                    **attrs,
                 }
                 if prop["titulo"] and prop["precio"] > 0:
                     results.append(prop)
-            except: pass
+            except Exception as e:
+                log.debug(f"  item error: {e}")
+
         log.info(f"  pág {pag}: {len(results)} acumulados")
+
     return results
 
-# ─── MERCADO LIBRE ────────────────────────────────────────────────
-def scrape_ml(tipo, propiedad):
+
+# ─── PORTAL INMOBILIARIO (HTML scraping) ─────────────────────────
+def scrape_portal_inmobiliario(tipo, propiedad):
     results = []
-    log.info(f"[Mercado Libre] {tipo} / {propiedad}")
-    for pag in range(1, PAGINAS_POR_PORTAL + 1):
-        offset = (pag - 1) * 48 + 1
-        url = f"https://listado.mercadolibre.cl/{propiedad}-{tipo}/_Desde_{offset}_NoIndex_True"
-        r = get(url)
-        if not r: continue
+    log.info(f"[Portal Inmobiliario] {tipo}/{propiedad}")
+
+    for pag in range(1, PAGINAS + 1):
+        url = f"https://www.portalinmobiliario.com/{tipo}/{propiedad}/_Desde_{(pag-1)*20+1}_NoIndex_True"
+        r = get_html(url)
+        if not r:
+            continue
+
         soup = BeautifulSoup(r.text, "html.parser")
-        cards = soup.select(".ui-search-result__wrapper")
-        for card in cards:
+
+        # Buscar datos en el JSON embebido en el HTML (más confiable que el HTML)
+        scripts = soup.find_all("script", type="application/json")
+        for script in scripts:
             try:
-                titulo = card.select_one(".ui-search-item__title")
-                precio_el = card.select_one(".price-tag-fraction")
-                ubicacion = card.select_one(".ui-search-item__location")
-                link = card.select_one("a.ui-search-link")
-                img = card.select_one("img[data-src], img[src]")
-                attrs_text = " ".join(a.get_text() for a in card.select(".ui-search-card-attributes__attribute"))
-                dorm = re.search(r"(\d+)\s*dorm", attrs_text, re.I)
-                bano = re.search(r"(\d+)\s*baño", attrs_text, re.I)
-                sup  = re.search(r"(\d+)\s*m²", attrs_text)
-                prop = {
-                    "titulo": titulo.get_text(strip=True) if titulo else "",
-                    "tipo": tipo, "propiedad": propiedad,
-                    "comuna": ubicacion.get_text(strip=True) if ubicacion else "",
-                    "precio": num(precio_el.get_text() if precio_el else "0"),
-                    "uf": None,
-                    "dormitorios": int(dorm.group(1)) if dorm else 0,
-                    "banos": int(bano.group(1)) if bano else 0,
-                    "superficie": int(sup.group(1)) if sup else 0,
-                    "portal": "Mercado Libre",
-                    "url": link["href"] if link else "",
-                    "foto": (img.get("data-src") or img.get("src","")) if img else "",
-                    "fecha": datetime.now().isoformat(),
-                    "fecha_scraping": datetime.now().isoformat(),
-                }
-                if prop["titulo"] and prop["precio"] > 0:
-                    results.append(prop)
+                data = json.loads(script.string or "")
+                items = []
+                if isinstance(data, dict):
+                    items = (data.get("initialState", {})
+                             .get("results", {})
+                             .get("results", []))
+                for item in items:
+                    try:
+                        precio = int(item.get("price", {}).get("amount", 0) or 0)
+                        prop = {
+                            "titulo": item.get("title", ""),
+                            "tipo": tipo, "propiedad": propiedad,
+                            "comuna": item.get("location", {}).get("city", {}).get("name", ""),
+                            "precio": precio,
+                            "uf": None,
+                            "dormitorios": 0, "banos": 0, "superficie": 0,
+                            "portal": "Portal Inmobiliario",
+                            "url": item.get("permalink", ""),
+                            "foto": item.get("thumbnail", ""),
+                            "fecha": datetime.now().isoformat(),
+                            "fecha_scraping": datetime.now().isoformat(),
+                        }
+                        for a in item.get("attributes", []):
+                            iid = a.get("id", "")
+                            val = a.get("value_name", "")
+                            if "BEDROOM" in iid: prop["dormitorios"] = num(val)
+                            elif "BATHROOM" in iid: prop["banos"] = num(val)
+                            elif "AREA" in iid: prop["superficie"] = num(val)
+                        if prop["titulo"] and prop["precio"] > 0:
+                            results.append(prop)
+                    except: pass
             except: pass
+
+        # Fallback: selectores HTML directos
+        if not results:
+            cards = soup.select("li.ui-search-layout__item, .ui-search-result__wrapper")
+            for card in cards:
+                try:
+                    titulo = card.select_one("[class*='title']") or card.select_one("h2")
+                    precio_el = card.select_one("[class*='price-tag-fraction']") or card.select_one("[class*='price']")
+                    link = card.select_one("a[href]")
+                    img = card.select_one("img[data-src], img[src]")
+                    ubicacion = card.select_one("[class*='location']")
+                    texto = card.get_text(" ", strip=True)
+                    dorm = re.search(r"(\d+)\s*dorm", texto, re.I)
+                    bano = re.search(r"(\d+)\s*baño", texto, re.I)
+                    sup  = re.search(r"(\d+)\s*m[²2]", texto)
+                    prop = {
+                        "titulo": titulo.get_text(strip=True) if titulo else "",
+                        "tipo": tipo, "propiedad": propiedad,
+                        "comuna": ubicacion.get_text(strip=True) if ubicacion else "",
+                        "precio": limpiar_precio(precio_el.get_text() if precio_el else "0"),
+                        "uf": None,
+                        "dormitorios": int(dorm.group(1)) if dorm else 0,
+                        "banos": int(bano.group(1)) if bano else 0,
+                        "superficie": int(sup.group(1)) if sup else 0,
+                        "portal": "Portal Inmobiliario",
+                        "url": link["href"] if link else "",
+                        "foto": (img.get("data-src") or img.get("src","")) if img else "",
+                        "fecha": datetime.now().isoformat(),
+                        "fecha_scraping": datetime.now().isoformat(),
+                    }
+                    if prop["titulo"] and prop["precio"] > 0:
+                        results.append(prop)
+                except: pass
+
         log.info(f"  pág {pag}: {len(results)} acumulados")
+
     return results
+
 
 # ─── YAPO ─────────────────────────────────────────────────────────
 def scrape_yapo(tipo, propiedad):
     results = []
-    cat_map = {"departamento": "departamentos", "casa": "casas", "oficina": "oficinas", "local": "locales-comerciales"}
-    cat = cat_map.get(propiedad, "propiedades")
-    log.info(f"[Yapo] {tipo} / {propiedad}")
-    for pag in range(1, PAGINAS_POR_PORTAL + 1):
-        url = f"https://www.yapo.cl/chile/{cat}?ad_type=offer&real_estate_operation={tipo}&page={pag}"
-        r = get(url)
+    log.info(f"[Yapo] {tipo}/{propiedad}")
+
+    cat_map = {
+        "departamento": "departamentos_y_flats",
+        "casa": "casas",
+        "oficina": "oficinas_y_locales",
+        "local": "oficinas_y_locales",
+        "terreno": "terrenos_y_parcelas",
+    }
+    cat = cat_map.get(propiedad, "departamentos_y_flats")
+    op_param = "arriendo" if tipo == "arriendo" else "venta"
+
+    for pag in range(1, PAGINAS + 1):
+        url = f"https://www.yapo.cl/region_metropolitana/{cat}?real_estate_operation={op_param}&page={pag}"
+        r = get_html(url)
         if not r: continue
         soup = BeautifulSoup(r.text, "html.parser")
-        cards = soup.select("article.listing-card, .ad-listing-item, li[data-ad-id]")
+
+        cards = (soup.select("article.listing-card") or
+                 soup.select("[class*='listing-card']") or
+                 soup.select(".ad-listing-item") or
+                 soup.select("li[data-ad-id]"))
+
         for card in cards:
             try:
-                titulo = card.select_one("h2, h3, .listing-card__title, [class*=title]")
-                precio_el = card.select_one(".listing-card__price, [class*=price]")
-                ubicacion = card.select_one(".listing-card__location, [class*=location]")
+                titulo = card.select_one("h2, h3, [class*='title']")
+                precio_el = card.select_one("[class*='price']")
                 link = card.select_one("a[href]")
-                img = card.select_one("img[src], img[data-src]")
-                href = (link["href"] if link else "")
+                img = card.select_one("img")
+                ubicacion = card.select_one("[class*='location'], [class*='commune']")
+
+                href = link["href"] if link else ""
                 if href and not href.startswith("http"):
                     href = "https://www.yapo.cl" + href
-                titulo_txt = titulo.get_text(strip=True) if titulo else ""
-                dorm = re.search(r"(\d+)\s*dorm", titulo_txt, re.I)
-                sup  = re.search(r"(\d+)\s*m²", titulo_txt)
+
+                foto = ""
+                if img:
+                    foto = img.get("data-lazy") or img.get("data-src") or img.get("src", "")
+
+                texto = card.get_text(" ", strip=True)
+                dorm = re.search(r"(\d+)\s*dorm", texto, re.I)
+                bano = re.search(r"(\d+)\s*baño", texto, re.I)
+                sup  = re.search(r"(\d+)\s*m[²2]", texto)
+
                 prop = {
-                    "titulo": titulo_txt,
+                    "titulo": titulo.get_text(strip=True) if titulo else "",
                     "tipo": tipo, "propiedad": propiedad,
-                    "comuna": ubicacion.get_text(strip=True) if ubicacion else "",
-                    "precio": num(precio_el.get_text() if precio_el else "0"),
+                    "comuna": ubicacion.get_text(strip=True) if ubicacion else "Región Metropolitana",
+                    "precio": limpiar_precio(precio_el.get_text() if precio_el else "0"),
                     "uf": None,
                     "dormitorios": int(dorm.group(1)) if dorm else 0,
-                    "banos": 0,
+                    "banos": int(bano.group(1)) if bano else 0,
                     "superficie": int(sup.group(1)) if sup else 0,
                     "portal": "Yapo",
                     "url": href,
-                    "foto": (img.get("src") or img.get("data-src","")) if img else "",
+                    "foto": foto,
                     "fecha": datetime.now().isoformat(),
                     "fecha_scraping": datetime.now().isoformat(),
                 }
                 if prop["titulo"] and prop["precio"] > 0:
                     results.append(prop)
             except: pass
+
         log.info(f"  pág {pag}: {len(results)} acumulados")
+
     return results
+
 
 # ─── TOCTOC ───────────────────────────────────────────────────────
 def scrape_toctoc(tipo, propiedad):
     results = []
-    log.info(f"[TocToc] {tipo} / {propiedad}")
-    for pag in range(1, PAGINAS_POR_PORTAL + 1):
-        url = f"https://www.toctoc.com/{tipo}/{propiedad}?page={pag}"
-        r = get(url)
+    log.info(f"[TocToc] {tipo}/{propiedad}")
+
+    prop_map = {
+        "departamento": "departamento",
+        "casa": "casa",
+        "oficina": "oficina",
+        "local": "local-comercial",
+        "terreno": "terreno",
+    }
+    prop_url = prop_map.get(propiedad, "departamento")
+
+    for pag in range(1, PAGINAS + 1):
+        url = f"https://www.toctoc.com/{tipo}/{prop_url}?page={pag}"
+        r = get_html(url)
         if not r: continue
         soup = BeautifulSoup(r.text, "html.parser")
-        # TocToc usa diferentes selectores según versión
-        cards = soup.select("[class*=PropertyCard],[class*=property-card],[class*=listing-card],.result-item")
+
+        # Buscar JSON embebido
+        for script in soup.find_all("script"):
+            txt = script.string or ""
+            if "listings" in txt or "propiedades" in txt:
+                try:
+                    match = re.search(r'"listings"\s*:\s*(\[.*?\])', txt, re.DOTALL)
+                    if match:
+                        items = json.loads(match.group(1))
+                        for item in items:
+                            try:
+                                prop = {
+                                    "titulo": item.get("title", item.get("titulo", "")),
+                                    "tipo": tipo, "propiedad": propiedad,
+                                    "comuna": item.get("commune", item.get("comuna", "")),
+                                    "precio": int(item.get("price", item.get("precio", 0)) or 0),
+                                    "uf": item.get("uf_price"),
+                                    "dormitorios": int(item.get("bedrooms", item.get("dormitorios", 0)) or 0),
+                                    "banos": int(item.get("bathrooms", item.get("banos", 0)) or 0),
+                                    "superficie": int(item.get("total_area", item.get("superficie", 0)) or 0),
+                                    "portal": "TocToc",
+                                    "url": item.get("url", item.get("link", "")),
+                                    "foto": item.get("main_image", item.get("photo", "")),
+                                    "fecha": datetime.now().isoformat(),
+                                    "fecha_scraping": datetime.now().isoformat(),
+                                }
+                                if prop["titulo"] and prop["precio"] > 0:
+                                    results.append(prop)
+                            except: pass
+                except: pass
+
+        # Fallback HTML
+        cards = (soup.select("[class*='PropertyCard']") or
+                 soup.select("[class*='property-card']") or
+                 soup.select("article"))
+
         for card in cards:
             try:
-                titulo = card.select_one("h2,h3,[class*=title],[class*=Title]")
-                precio_el = card.select_one("[class*=price],[class*=Price]")
-                ubicacion = card.select_one("[class*=location],[class*=Location],[class*=address]")
+                titulo = card.select_one("h2, h3, [class*='Title'], [class*='title']")
+                precio_el = card.select_one("[class*='Price'], [class*='price']")
                 link = card.select_one("a[href]")
-                img = card.select_one("img[src],img[data-src]")
-                href = (link["href"] if link else "")
+                img = card.select_one("img")
+                ubicacion = card.select_one("[class*='Location'], [class*='location'], [class*='commune']")
+
+                href = link["href"] if link else ""
                 if href and not href.startswith("http"):
                     href = "https://www.toctoc.com" + href
-                card_txt = card.get_text()
-                dorm = re.search(r"(\d+)\s*dorm", card_txt, re.I)
-                bano = re.search(r"(\d+)\s*baño", card_txt, re.I)
-                sup  = re.search(r"(\d+)\s*m²", card_txt)
+
+                texto = card.get_text(" ", strip=True)
+                dorm = re.search(r"(\d+)\s*dorm", texto, re.I)
+                bano = re.search(r"(\d+)\s*baño", texto, re.I)
+                sup  = re.search(r"(\d+)\s*m[²2]", texto)
+
                 prop = {
                     "titulo": titulo.get_text(strip=True) if titulo else "",
                     "tipo": tipo, "propiedad": propiedad,
                     "comuna": ubicacion.get_text(strip=True) if ubicacion else "",
-                    "precio": num(precio_el.get_text() if precio_el else "0"),
+                    "precio": limpiar_precio(precio_el.get_text() if precio_el else "0"),
                     "uf": None,
                     "dormitorios": int(dorm.group(1)) if dorm else 0,
                     "banos": int(bano.group(1)) if bano else 0,
@@ -214,15 +381,18 @@ def scrape_toctoc(tipo, propiedad):
                 if prop["titulo"] and prop["precio"] > 0:
                     results.append(prop)
             except: pass
+
         log.info(f"  pág {pag}: {len(results)} acumulados")
+
     return results
+
 
 # ─── MOTOR PRINCIPAL ──────────────────────────────────────────────
 SCRAPERS = [
-    ("Portal Inmobiliario", scrape_pi),
-    ("Mercado Libre",       scrape_ml),
-    ("Yapo",                scrape_yapo),
-    ("TocToc",              scrape_toctoc),
+    ("Mercado Libre",        scrape_mercadolibre),
+    ("Portal Inmobiliario",  scrape_portal_inmobiliario),
+    ("Yapo",                 scrape_yapo),
+    ("TocToc",               scrape_toctoc),
 ]
 
 COMBOS = [
@@ -244,11 +414,11 @@ def correr():
             try:
                 r = fn(tipo, prop)
                 todas.extend(r)
-                log.info(f"  ✓ {nombre} {tipo}/{prop}: {len(r)} propiedades")
+                log.info(f"✓ {nombre} {tipo}/{prop}: {len(r)}")
             except Exception as e:
-                log.error(f"  ✗ {nombre} {tipo}/{prop}: {e}")
+                log.error(f"✗ {nombre} {tipo}/{prop}: {e}")
 
-    # Deduplicar por URL
+    # Deduplicar
     vistas, unicas = set(), []
     for p in todas:
         key = p.get("url","") or p.get("titulo","")
@@ -256,17 +426,16 @@ def correr():
             vistas.add(key)
             unicas.append(p)
 
-    # Asignar IDs
     for i, p in enumerate(unicas, 1):
         p["id"] = i
 
-    log.info(f"\nTOTAL: {len(unicas)} propiedades únicas de {len(todas)} encontradas")
+    log.info(f"\nTOTAL FINAL: {len(unicas)} propiedades únicas")
 
-    # Guardar JSON
     out = Path("propiedades.json")
     with open(out, "w", encoding="utf-8") as f:
         json.dump(unicas, f, ensure_ascii=False, separators=(",",":"))
-    log.info(f"Guardado: {out.resolve()}")
+
+    log.info(f"✓ Guardado: {out.resolve()}")
     log.info("=" * 55)
     return unicas
 
